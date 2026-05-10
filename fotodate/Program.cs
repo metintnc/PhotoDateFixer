@@ -6,6 +6,7 @@ using System.Text.RegularExpressions;
 using System.Globalization;
 using MetadataExtractor;
 using MetadataExtractor.Formats.Exif;
+using ImageMagick;
 
 namespace fotodate
 {
@@ -37,10 +38,21 @@ namespace fotodate
 
             int successCount = 0;
             int failCount = 0;
+            int processedCount = 0;
+            int totalFiles = files.Count;
 
             foreach (var file in files)
             {
-                DateTime? dateTaken = GetDateFromExif(file) ?? GetDateFromJson(file) ?? GetDateFromFileName(file);
+                processedCount++;
+                double percentage = ((double)processedCount / totalFiles) * 100;
+
+                // Konsol başlığında yüzdeyi göster
+                Console.Title = isEng ? $"fotodate - Progress: {percentage:F1}%" : $"fotodate - İlerleme: %{percentage:F1}";
+
+                // Öncelik Sırası: Önce JSON -> Sonra Dosya İsmi -> En son EXIF
+                DateTime? dateTaken = GetDateFromJson(file) ?? GetDateFromFileName(file) ?? GetDateFromExif(file);
+
+                string logMessage = "";
 
                 if (dateTaken.HasValue)
                 {
@@ -57,28 +69,44 @@ namespace fotodate
                         File.SetCreationTime(file, dateTaken.Value);
                         File.SetLastWriteTime(file, dateTaken.Value);
 
+                        // Fotoğrafın içine (EXIF) tarihi yaz
+                        WriteExifDate(file, dateTaken.Value);
+
                         // Dosya aslında salt okunursa eski haline geri getir
                         if (isReadOnly)
                         {
                             File.SetAttributes(file, attributes);
                         }
 
-                        Console.WriteLine(isEng ? $"[SUCCESS] {Path.GetFileName(file)} -> {dateTaken.Value}" : $"[BAŞARILI] {Path.GetFileName(file)} -> {dateTaken.Value}");
+                        logMessage = isEng ? $"[SUCCESS] {Path.GetFileName(file)} -> {dateTaken.Value}" : $"[BAŞARILI] {Path.GetFileName(file)} -> {dateTaken.Value}";
                         successCount++;
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine(isEng ? $"[ERROR] {Path.GetFileName(file)} could not be updated: {ex.Message}" : $"[HATA] {Path.GetFileName(file)} güncellenemedi: {ex.Message}");
+                        logMessage = isEng ? $"[ERROR] {Path.GetFileName(file)} could not be updated: {ex.Message}" : $"[HATA] {Path.GetFileName(file)} güncellenemedi: {ex.Message}";
                         failCount++;
                     }
                 }
                 else
                 {
-                    Console.WriteLine(isEng ? $"[SKIPPED] No date found for {Path.GetFileName(file)}." : $"[ATLANDI] {Path.GetFileName(file)} için tarih bulunamadı.");
+                    logMessage = isEng ? $"[SKIPPED] No date found for {Path.GetFileName(file)}." : $"[ATLANDI] {Path.GetFileName(file)} için tarih bulunamadı.";
                     failCount++;
                 }
+
+                // Bulunduğumuz satırı temizle (eski yüzde yazısını silmek için)
+                int windowWidth = Console.WindowWidth > 0 ? Console.WindowWidth - 1 : 50;
+                Console.Write("\r" + new string(' ', windowWidth) + "\r");
+
+                // İşlem logunu bir alt satıra yazdır
+                Console.WriteLine(logMessage);
+
+                // En alta sürekli yenilenecek olan yüzdeyi yaz (imleç aynı satırda kalsın diye WriteLine kullanmıyoruz)
+                Console.Write(isEng ? $"Progress: {percentage:F1}%" : $"İlerleme: %{percentage:F1}");
             }
 
+            Console.WriteLine(); // İşlem bitince son yüzde satırının altına geç
+
+            Console.Title = isEng ? "fotodate - Completed" : "fotodate - Tamamlandı";
             Console.WriteLine(isEng ? $"Process completed. {successCount} successful, {failCount} failed/skipped." : $"İşlem tamamlandı. {successCount} başarılı, {failCount} başarısız/atlanan.");
             Console.WriteLine(isEng ? "Press any key to exit..." : "Çıkmak için bir tuşa basın...");
             Console.ReadKey();
@@ -101,6 +129,37 @@ namespace fotodate
                 // Metadata okuma hatası durumunda sessizce geç
             }
             return null;
+        }
+
+        static void WriteExifDate(string filePath, DateTime date)
+        {
+            string ext = Path.GetExtension(filePath).ToLower();
+            if (ext == ".jpg" || ext == ".jpeg" || ext == ".png")
+            {
+                try
+                {
+                    using (var image = new MagickImage(filePath))
+                    {
+                        var profile = image.GetExifProfile();
+                        if (profile == null)
+                        {
+                            profile = new ExifProfile();
+                        }
+                        
+                        string exifStr = date.ToString("yyyy:MM:dd HH:mm:ss");
+                        profile.SetValue(ExifTag.DateTimeOriginal, exifStr);
+                        profile.SetValue(ExifTag.DateTimeDigitized, exifStr);
+                        profile.SetValue(ExifTag.DateTime, exifStr);
+                        
+                        image.SetProfile(profile);
+                        image.Write(filePath);
+                    }
+                }
+                catch
+                {
+                    // Bazı dosyalar desteklenmeyebilir veya bozuk olabilir, hata verirsek devam etsin
+                }
+            }
         }
 
         static DateTime? GetDateFromJson(string filePath)
@@ -182,6 +241,22 @@ namespace fotodate
                 if (match3.Success)
                 {
                     if (DateTime.TryParseExact(match3.Value, "yyyy-MM-dd-HH-mm-ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime dt))
+                        return dt;
+                }
+
+                // Pattern 4: Screenshot (örn: Screenshot_20190903-172454)
+                var match4 = Regex.Match(fileName, @"(?<!\d)(20\d{2})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?!\d)");
+                if (match4.Success)
+                {
+                    if (DateTime.TryParseExact(match4.Value, "yyyyMMdd-HHmmss", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime dt))
+                        return dt;
+                }
+
+                // Pattern 5: Düz yyyyMMdd (örn: 20211117-1, 20211117-2)
+                var match5 = Regex.Match(fileName, @"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)");
+                if (match5.Success)
+                {
+                    if (DateTime.TryParseExact(match5.Value, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime dt))
                         return dt;
                 }
             }
